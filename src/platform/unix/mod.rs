@@ -94,10 +94,15 @@ unsafe fn new_sockaddr_un(path: *const c_char) -> (sockaddr_un, usize) {
     (sockaddr, mem::size_of::<sockaddr_un>())
 }
 
-/// Builds a `sockaddr_un` for `name`. On Linux, a name prefixed with `@`
-/// is bound in the abstract namespace (`sun_path[0] = 0`) instead of on
-/// the filesystem — no directory or inode is ever created for it. Any
-/// other name goes through the regular filesystem-backed encoding.
+/// Builds a `sockaddr_un` for `name`. The `@` prefix is the user-space
+/// convention (see systemd `ListenStream=@`, socat `ABSTRACT-LISTEN:`,
+/// and how `ss -x` / `netstat -x` render abstract sockets) for opting
+/// into the Linux abstract namespace.
+///
+/// A name without `@` falls back to the regular filesystem-backed
+/// encoding, which keeps this helper generic enough for future callers
+/// that may want filesystem sockets on Linux too (e.g. for compatibility
+/// with non-abstract clients).
 unsafe fn build_sockaddr(name: &str) -> Result<(sockaddr_un, usize), UnixError> {
     #[cfg(target_os = "linux")]
     if let Some(abstract_name) = name.strip_prefix('@') {
@@ -109,6 +114,13 @@ unsafe fn build_sockaddr(name: &str) -> Result<(sockaddr_un, usize), UnixError> 
         if bytes.len() > max_len {
             return Err(UnixError::last());
         }
+        // Linux abstract namespace (see man 7 unix): sun_path[0] is a marker
+        // (NUL), not a terminator. The kernel uses addrlen to determine the
+        // address bytes, so the name goes in sun_path[1..].
+        //
+        // The null-terminated pathname requirement from connect(2) applies to
+        // filesystem-backed pathname sockets; Linux abstract sockets use addrlen
+        // to determine the address bytes instead.
         for (i, b) in bytes.iter().enumerate() {
             sockaddr.sun_path[i + 1] = *b as c_char;
         }
