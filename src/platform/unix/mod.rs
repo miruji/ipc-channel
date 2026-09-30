@@ -83,6 +83,10 @@ pub enum OsTrySelectError {
     Empty,
 }
 
+/// Builds a filesystem-backed `sockaddr_un` for a pathname socket. Only used
+/// on non-Linux Unix targets; Linux goes through the abstract-namespace
+/// branch in `build_sockaddr` instead.
+#[cfg(not(target_os = "linux"))]
 unsafe fn new_sockaddr_un(path: *const c_char) -> (sockaddr_un, usize) {
     let mut sockaddr: sockaddr_un = mem::zeroed();
     libc::strncpy(
@@ -94,22 +98,26 @@ unsafe fn new_sockaddr_un(path: *const c_char) -> (sockaddr_un, usize) {
     (sockaddr, mem::size_of::<sockaddr_un>())
 }
 
-/// Builds a `sockaddr_un` for `name`. The `@` prefix is the user-space
-/// convention (see systemd `ListenStream=@`, socat `ABSTRACT-LISTEN:`,
-/// and how `ss -x` / `netstat -x` render abstract sockets) for opting
-/// into the Linux abstract namespace.
+/// Builds a `sockaddr_un` for `name`.
 ///
-/// A name without `@` falls back to the regular filesystem-backed
-/// encoding, which keeps this helper generic enough for future callers
-/// that may want filesystem sockets on Linux too (e.g. for compatibility
-/// with non-abstract clients).
+/// On Linux the name is placed in the abstract socket namespace
+/// (see man 7 unix): `sun_path[0]` is a NUL marker rather than a
+/// terminator, the kernel uses `addrlen` to determine the address
+/// bytes, and no filesystem entry is created. This lets the one-shot
+/// server bind without a writable temp directory, which matters in
+/// containers/sandboxes where `/tmp` is read-only.
+///
+/// On other Unix targets there is no abstract namespace, so the name
+/// is encoded as a regular filesystem-backed pathname (see
+/// `new_sockaddr_un`).
 unsafe fn build_sockaddr(name: &str) -> Result<(sockaddr_un, usize), UnixError> {
     #[cfg(target_os = "linux")]
-    if let Some(abstract_name) = name.strip_prefix('@') {
+    {
         let mut sockaddr: sockaddr_un = mem::zeroed();
         sockaddr.sun_family = libc::AF_UNIX as sa_family_t;
-        // sun_path[0] = 0 (already zeroed) marks this abstract on Linux.
-        let bytes = abstract_name.as_bytes();
+        // sun_path[0] = 0 (already zeroed) marks this as an abstract
+        // socket address on Linux (see man 7 unix).
+        let bytes = name.as_bytes();
         let max_len = sockaddr.sun_path.len() - 1; // leave room for the leading NUL
         if bytes.len() > max_len {
             return Err(UnixError::last());
@@ -125,14 +133,21 @@ unsafe fn build_sockaddr(name: &str) -> Result<(sockaddr_un, usize), UnixError> 
             sockaddr.sun_path[i + 1] = *b as c_char;
         }
         let addr_len = size_of::<sa_family_t>() + 1 + bytes.len();
-        return Ok((sockaddr, addr_len));
+        Ok((sockaddr, addr_len))
     }
-    let c_name = CString::new(name).unwrap();
-    Ok(new_sockaddr_un(c_name.as_ptr()))
+
+    // Fallback for non-Linux Unix targets: encode `name` as a regular
+    // filesystem-backed pathname.
+    #[cfg(not(target_os = "linux"))]
+    {
+        let c_name = CString::new(name).unwrap();
+        Ok(new_sockaddr_un(c_name.as_ptr()))
+    }
 }
 
-/// Generates a random name for an abstract-namespace socket, prefixed
-/// with `@` so `build_sockaddr` recognises it.
+/// Generates a random name for an abstract-namespace socket. The
+/// returned name has no filesystem meaning on Linux; `build_sockaddr`
+/// interprets it directly as an abstract-namespace address.
 #[cfg(target_os = "linux")]
 fn make_abstract_name() -> String {
     let mut buf = [0u8; 16];
@@ -143,7 +158,7 @@ fn make_abstract_name() -> String {
     for b in buf {
         hex.push_str(&format!("{:02x}", b));
     }
-    format!("@ipc-osn-{hex}")
+    format!("ipc-osn-{hex}")
 }
 
 static SYSTEM_SENDBUF_SIZE: LazyLock<usize> = LazyLock::new(|| {
